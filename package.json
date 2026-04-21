@@ -1,0 +1,15 @@
+{
+  "name": "@workspace/api-server",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "build": "echo no build needed"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1",
+    "nanoid": "^5.0.9"
+  }
+}
