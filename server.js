@@ -60,10 +60,13 @@ function sanitizeGameForPlayer(game, room, playerId) {
   const isEliminated = playerId && game.eliminated.includes(playerId);
   const isSpectator = isEliminated || !playerId;
 
-  // Spectators can see all hands if host enabled it
+  // Spectators can see all hands if host enabled it.
+  // At round end and game end, EVERYONE sees all hands.
   let yourHand = playerId ? game.hands[playerId] || [] : [];
   let allHands = null;
-  if (isSpectator && game.showHandsToSpectators) {
+  if (game.phase === "roundEnd" || game.phase === "gameEnd") {
+    allHands = game.hands;
+  } else if (isSpectator && game.showHandsToSpectators) {
     allHands = game.hands;
   }
 
