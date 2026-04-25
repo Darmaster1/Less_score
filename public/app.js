@@ -15,15 +15,19 @@ const CARD_BACKS = [
 ];
 
 const state = {
-  view: "home", // home | lobby | game
+  view: "home",
   code: null,
   playerId: null,
   room: null,
   selected: new Set(),
   drawChoice: null,
   drawCardId: null,
-  modal: null, // 'rules' | 'cardback' | 'rules-settings' | null
+  modal: null, // 'rules' | 'cardback' | 'rules-settings' | 'chat' | null
   myCardBack: localStorage.getItem("ls_cardback") || "classic-blue",
+  lastSeenChatLen: 0,
+  lastTurnPid: null,
+  toast: null,
+  lastLogLen: 0,
 };
 
 function saveSession() {
@@ -54,19 +58,48 @@ socket.on("connect", () => {
 });
 
 socket.on("room:state", (room) => {
+  const prev = state.room;
   state.room = room;
   state.view = room.game ? "game" : "lobby";
+
   if (room.game) {
     if (room.game.currentTurnPlayerId !== room.youId) {
       state.selected.clear();
       state.drawChoice = null;
       state.drawCardId = null;
     }
+    // Vibrate when it's your turn
+    if (room.game.phase === "playing" && room.game.currentTurnPlayerId === room.youId) {
+      if (state.lastTurnPid !== room.youId) {
+        if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
+      }
+      state.lastTurnPid = room.youId;
+    } else if (room.game.currentTurnPlayerId !== room.youId) {
+      state.lastTurnPid = room.game.currentTurnPlayerId;
+    }
+    // Toast for new game-log entry (replaces deleted log panel)
+    const log = room.game.log || [];
+    if (log.length > state.lastLogLen) {
+      const newest = log[log.length - 1];
+      if (newest && state.lastLogLen !== 0) showToast(newest.msg);
+      state.lastLogLen = log.length;
+    } else if (state.lastLogLen === 0) {
+      state.lastLogLen = log.length;
+    }
+  } else {
+    state.lastLogLen = 0;
   }
+
   render();
 });
 
-// =============== ROUTING ===============
+function showToast(msg) {
+  state.toast = { msg, t: Date.now() };
+  clearTimeout(window.__toast);
+  window.__toast = setTimeout(() => { state.toast = null; render(); }, 4000);
+}
+
+// =============== RENDER ENTRY ===============
 
 function render() {
   const root = document.getElementById("app");
@@ -75,6 +108,14 @@ function render() {
   else if (state.view === "lobby") root.appendChild(renderLobby());
   else if (state.view === "game") root.appendChild(renderGame());
   if (state.modal) root.appendChild(renderModal());
+  if (state.toast) root.appendChild(renderToast());
+}
+
+function renderToast() {
+  const wrap = el("div", "");
+  wrap.style.cssText = "position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:rgba(15,23,42,.95);border:1px solid rgba(99,102,241,.5);padding:10px 18px;border-radius:24px;z-index:50;font-size:.9rem;max-width:90%;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,.4);";
+  wrap.textContent = state.toast.msg;
+  return wrap;
 }
 
 // =============== HOME ===============
@@ -166,13 +207,14 @@ function renderLobby() {
     <h1 style="text-align:center">Lobby</h1>
     <div class="code-display">${room.code}</div>
     <div class="row" style="justify-content:center">
-      <button class="ghost" id="copy-code">Copy code</button>
-      <button class="ghost" id="copy-link">Copy invite link</button>
-      <button class="ghost" id="cardback-btn">Card back: ${cardBackName(me.cardBack)}</button>
+      <button class="ghost icon" id="copy-code">Copy code</button>
+      <button class="ghost icon" id="copy-link">Copy invite link</button>
+      <button class="ghost icon" id="cardback-btn">🎴 ${cardBackName(me.cardBack)}</button>
       <button class="ghost icon" id="rules-help">? Rules</button>
-      <button class="ghost danger" id="leave">Leave</button>
+      <button class="ghost icon" id="chat-btn">💬 Chat${unreadCount() ? ` <span class="badge">${unreadCount()}</span>` : ""}</button>
+      <button class="ghost danger icon" id="leave">Leave</button>
     </div>
-    <small style="text-align:center">Share the code or link with friends and family. They can join from any device — phone or laptop.</small>
+    <small style="text-align:center">Share the code or link with friends. They can join from any device — phone or laptop.</small>
   `;
   wrap.appendChild(top);
 
@@ -180,9 +222,9 @@ function renderLobby() {
   top.querySelector("#copy-link").onclick = () => copyToClipboard(inviteUrl);
   top.querySelector("#cardback-btn").onclick = () => { state.modal = "cardback"; render(); };
   top.querySelector("#rules-help").onclick = () => { state.modal = "rules"; render(); };
+  top.querySelector("#chat-btn").onclick = () => openChat();
   top.querySelector("#leave").onclick = () => { clearSession(); location.href = location.pathname; };
 
-  // Players
   const playersCard = el("div", "card-ui col");
   playersCard.innerHTML = `<div class="section-title"><span>Players (${room.players.length})</span><small>${allReady ? "Everyone ready ✓" : "Waiting for ready"}</small></div>`;
   const list = el("div", "row");
@@ -198,14 +240,12 @@ function renderLobby() {
   }
   playersCard.appendChild(list);
 
-  // Ready button
   const readyBtn = el("button", me.ready ? "ghost" : "success");
   readyBtn.textContent = me.ready ? "Cancel Ready" : "I'm Ready";
   readyBtn.onclick = () => socket.emit("player:setReady", { ready: !me.ready });
   playersCard.appendChild(readyBtn);
   wrap.appendChild(playersCard);
 
-  // Host: game settings
   const settingsCard = el("div", "card-ui col");
   settingsCard.innerHTML = `<div class="section-title"><span>Game Settings ${isHost ? "" : "(host only)"}</span><button class="ghost icon" id="open-rules-settings">${isHost ? "Customize Rules" : "View Rules"}</button></div>`;
   settingsCard.querySelector("#open-rules-settings").onclick = () => { state.modal = "rules-settings"; render(); };
@@ -217,12 +257,10 @@ function renderLobby() {
       <option value="setpoints" ${room.settings.mode === "setpoints" ? "selected" : ""}>Set Points (last to reach limit wins)</option>
       <option value="elimination" ${room.settings.mode === "elimination" ? "selected" : ""}>Elimination (highest each round out)</option>
     </select>
-
     <div id="limit-wrap" style="display:${room.settings.mode === "setpoints" ? "" : "none"}">
       <label>Point limit</label>
       <input id="limit" type="number" min="10" value="${room.settings.pointLimit}" ${isHost ? "" : "disabled"} />
     </div>
-
     <label>Turn timer</label>
     <select id="timer" ${isHost ? "" : "disabled"}>
       <option value="0" ${room.settings.turnTimer === 0 ? "selected" : ""}>No timer</option>
@@ -232,20 +270,14 @@ function renderLobby() {
   `;
   settingsCard.appendChild(grid);
 
-  const startNote = !allReady ? `<small>Waiting for all players to ready up.</small>` : "";
   if (isHost) {
     const startBtn = el("button", "");
-    startBtn.id = "start";
     startBtn.disabled = !allReady;
     startBtn.textContent = allReady ? "Start Game" : (room.players.length < 2 ? "Need at least 2 players" : "All players must be ready");
     startBtn.onclick = () => socket.emit("room:start");
     settingsCard.appendChild(startBtn);
   } else {
     const w = el("small"); w.textContent = "Waiting for host to start…";
-    settingsCard.appendChild(w);
-  }
-  if (startNote && isHost) {
-    const w = el("small"); w.innerHTML = startNote;
     settingsCard.appendChild(w);
   }
   wrap.appendChild(settingsCard);
@@ -263,7 +295,6 @@ function renderLobby() {
     grid.querySelector("#timer").onchange = send;
   }
 
-  wrap.appendChild(renderChat());
   return wrap;
 }
 
@@ -274,25 +305,30 @@ function renderGame() {
   const game = room.game;
   const wrap = el("div", "container col");
 
-  // Top header bar
-  const header = el("div", "row");
-  header.style.justifyContent = "space-between";
-  header.style.alignItems = "center";
-  header.innerHTML = `<h2 style="margin:0">Less Score · Round ${game.roundNumber}</h2>`;
-  const headerActions = el("div", "row");
+  // Compact header
+  const header = el("div", "game-header");
+  header.innerHTML = `
+    <div class="title-block">
+      <h2>Less Score</h2>
+      <small>Round ${game.roundNumber} · ${game.mode === "setpoints" ? `to ${game.pointLimit}` : "elimination"}</small>
+    </div>
+  `;
+  const hbtns = el("div", "row");
   const helpBtn = el("button", "ghost icon"); helpBtn.textContent = "? Rules";
   helpBtn.onclick = () => { state.modal = "rules"; render(); };
-  headerActions.appendChild(helpBtn);
-  header.appendChild(headerActions);
+  hbtns.appendChild(helpBtn);
+  const chatBtn = el("button", "ghost icon");
+  chatBtn.innerHTML = `💬 Chat${unreadCount() ? ` <span class="badge">${unreadCount()}</span>` : ""}`;
+  chatBtn.onclick = () => openChat();
+  hbtns.appendChild(chatBtn);
+  header.appendChild(hbtns);
   wrap.appendChild(header);
 
   if (game.phase === "gameEnd") {
     wrap.appendChild(renderGameEnd(room, game));
-    wrap.appendChild(renderChat());
     return wrap;
   }
 
-  // Turn banner
   const yourTurn = game.currentTurnPlayerId === room.youId && !game.isSpectator;
   const currName = nameOf(room, game.currentTurnPlayerId);
   const banner = el("div", `turn-banner ${yourTurn ? "you" : ""}`);
@@ -311,8 +347,6 @@ function renderGame() {
   board.appendChild(renderRightCol(room, game));
   wrap.appendChild(board);
 
-  wrap.appendChild(renderChat());
-
   if (game.turnEndsAt && game.phase === "playing") {
     clearTimeout(window.__tt);
     window.__tt = setTimeout(render, 1000);
@@ -323,11 +357,17 @@ function renderGame() {
 
 function renderLeftCol(room, game, yourTurn) {
   const col = el("div", "col");
+
+  // If round ended, show all final hands prominently
+  if (game.phase === "roundEnd" && game.allHands) {
+    col.appendChild(renderAllHandsCard(room, game, "Round Hands"));
+  }
+
   const piles = el("div", "row");
 
   // Draw pile
   const draw = el("div", "pile");
-  draw.innerHTML = `<div class="label">Draw pile (${game.drawPileCount})</div>`;
+  draw.innerHTML = `<div class="label">Deck (${game.drawPileCount})</div>`;
   const drawCards = el("div", "discard-cards");
   drawCards.appendChild(makeCardEl(null, { faceDown: true, cardBack: myCardBack(room) }));
   draw.appendChild(drawCards);
@@ -339,7 +379,7 @@ function renderLeftCol(room, game, yourTurn) {
   }
   piles.appendChild(draw);
 
-  // Discard pile (only show last set)
+  // Discard pile
   const disc = el("div", "pile");
   disc.style.flex = "1";
   const lastByName = game.lastDiscardBy ? nameOf(room, game.lastDiscardBy) : null;
@@ -370,24 +410,14 @@ function renderLeftCol(room, game, yourTurn) {
 
   col.appendChild(piles);
 
-  // Spectator: show all hands if enabled
-  if (game.isSpectator && game.allHands) {
-    const spec = el("div", "card-ui");
-    spec.innerHTML = `<div class="section-title"><span>All hands (spectator view)</span></div>`;
-    for (const [pid, h] of Object.entries(game.allHands)) {
-      const sec = el("div", "");
-      sec.innerHTML = `<div style="margin-top:8px"><b>${escapeHtml(nameOf(room, pid))}</b> — ${handTotalOf(h)} pts</div>`;
-      const handDiv = el("div", "hand");
-      h.slice().sort((a, b) => a.rank - b.rank).forEach((c) => handDiv.appendChild(makeCardEl(c)));
-      sec.appendChild(handDiv);
-      spec.appendChild(sec);
-    }
-    col.appendChild(spec);
+  // Spectator with hands enabled (during play)
+  if (game.phase === "playing" && game.isSpectator && game.allHands) {
+    col.appendChild(renderAllHandsCard(room, game, "All hands (spectator)"));
   } else if (room.youId && game.yourHand && !game.eliminated.includes(room.youId)) {
     const handCard = el("div", "card-ui");
     const sortedHand = game.yourHand.slice().sort((a, b) => a.rank - b.rank || a.suit.localeCompare(b.suit));
     const total = handTotalOf(sortedHand);
-    handCard.innerHTML = `<div class="section-title"><span>Your hand · total ${total} pts</span></div>`;
+    handCard.innerHTML = `<div class="section-title"><span>Your hand · <span style="color:#fbbf24">${total} pts</span></span></div>`;
     const hand = el("div", "hand");
     for (const c of sortedHand) {
       const cEl = makeCardEl(c);
@@ -436,7 +466,7 @@ function renderLeftCol(room, game, yourTurn) {
 
       if (state.selected.size > 0) {
         const clr = el("button", "ghost");
-        clr.textContent = "Clear selection";
+        clr.textContent = "Clear";
         clr.onclick = () => {
           state.selected.clear();
           state.drawChoice = null;
@@ -466,53 +496,64 @@ function renderLeftCol(room, game, yourTurn) {
   return col;
 }
 
+function renderAllHandsCard(room, game, title) {
+  const card = el("div", "card-ui");
+  card.innerHTML = `<div class="section-title"><span>${escapeHtml(title)}</span></div>`;
+  for (const [pid, h] of Object.entries(game.allHands || {})) {
+    if (game.eliminated.includes(pid) && game.phase !== "gameEnd") continue;
+    const sec = el("div", "");
+    const isDecl = pid === game.declarerId;
+    sec.innerHTML = `<div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center"><div><b>${escapeHtml(nameOf(room, pid))}</b>${isDecl ? ' <span class="ready-badge">DECLARED</span>' : ""}</div><div style="color:#fbbf24;font-weight:700">${handTotalOf(h)} pts</div></div>`;
+    const handDiv = el("div", "hand");
+    h.slice().sort((a, b) => a.rank - b.rank).forEach((c) => handDiv.appendChild(makeCardEl(c)));
+    sec.appendChild(handDiv);
+    card.appendChild(sec);
+  }
+  return card;
+}
+
 function renderRightCol(room, game) {
   const col = el("div", "col");
-
   const sc = el("div", "card-ui");
-  sc.innerHTML = `<div class="section-title"><span>Players</span></div>`;
+  sc.innerHTML = `<div class="section-title"><span>Leaderboard</span></div>`;
   sc.appendChild(renderScores(room, game, false));
   col.appendChild(sc);
-
-  const logCard = el("div", "card-ui");
-  logCard.innerHTML = `<div class="section-title"><span>Game log</span></div>`;
-  const log = el("div", "log");
-  for (const e of game.log) {
-    const row = el("div", "entry");
-    row.textContent = e.msg;
-    log.appendChild(row);
-  }
-  logCard.appendChild(log);
-  col.appendChild(logCard);
-
   return col;
 }
 
 function renderScores(room, game, finalView) {
   const wrap = el("div", "scores");
-  for (const p of room.players) {
+  // Sort by cumulative score ascending (lower is better)
+  const sorted = room.players.slice().sort((a, b) => {
+    const elimA = game.eliminated.includes(a.id) ? 1 : 0;
+    const elimB = game.eliminated.includes(b.id) ? 1 : 0;
+    if (elimA !== elimB) return elimA - elimB;
+    return (game.cumulativeScores[a.id] || 0) - (game.cumulativeScores[b.id] || 0);
+  });
+  sorted.forEach((p, idx) => {
     const isElim = game.eliminated.includes(p.id);
     const isCurrent = !finalView && game.currentTurnPlayerId === p.id && game.phase === "playing";
     const row = el("div", `score-row ${isElim ? "eliminated" : ""} ${isCurrent ? "current" : ""}`);
     const cumScore = game.cumulativeScores[p.id] ?? 0;
     const handCount = game.handCounts[p.id] ?? 0;
     let right = "";
-    if (game.mode === "setpoints") right = `${cumScore} / ${game.pointLimit} pts`;
+    if (game.mode === "setpoints") right = `${cumScore} / ${game.pointLimit}`;
     else right = isElim ? "OUT" : `${handCount} cards`;
     if (game.lastRoundScores && game.lastRoundScores[p.id] !== undefined) {
       right = `+${game.lastRoundScores[p.id]} → ${cumScore}` + (game.mode === "setpoints" ? ` / ${game.pointLimit}` : "");
     }
+    const medal = (idx === 0 && !isElim) ? "🥇 " : (idx === 1 && !isElim) ? "🥈 " : (idx === 2 && !isElim) ? "🥉 " : "";
     row.innerHTML = `
-      <span>
+      <span>${medal}
         <span class="dot ${p.connected ? "" : "off"}"></span>
         ${escapeHtml(p.name)}${p.id === room.youId ? " (you)" : ""}
         ${p.isHost ? ' <span class="host-badge">H</span>' : ""}
-        ${isElim ? ' <span class="spec-badge">SPEC</span>' : ""}
+        ${isElim ? ' <span class="spec-badge">OUT</span>' : ""}
       </span>
       <span>${right}</span>
     `;
     wrap.appendChild(row);
-  }
+  });
   return wrap;
 }
 
@@ -564,7 +605,10 @@ function renderGameEnd(room, game) {
   `;
   card.appendChild(renderScores(room, game, true));
 
-  // Stats
+  if (game.allHands) {
+    card.appendChild(renderAllHandsCard(room, game, "Final hands"));
+  }
+
   const stats = computeAggregateStats(room, game);
   const sg = el("div", "");
   sg.innerHTML = `<h2 style="margin-top:18px">Match Statistics</h2>`;
@@ -596,7 +640,6 @@ function computeAggregateStats(room, game) {
   const out = [];
   const named = (pid) => pid ? nameOf(room, pid) : "—";
 
-  // Lowest average score
   let bestAvg = { pid: null, val: Infinity };
   for (const p of all) {
     const s = stats[p.id]; if (!s || !s.roundsPlayed) continue;
@@ -605,79 +648,66 @@ function computeAggregateStats(room, game) {
   }
   out.push({ label: "Lowest Average Score", value: named(bestAvg.pid), detail: bestAvg.val !== Infinity ? `${bestAvg.val.toFixed(1)} pts/round` : "" });
 
-  // Most successful declarations
   let mostDecWon = { pid: null, val: -1 };
-  for (const p of all) {
-    const s = stats[p.id] || {};
-    if ((s.declarationsWon || 0) > mostDecWon.val) mostDecWon = { pid: p.id, val: s.declarationsWon || 0 };
-  }
+  for (const p of all) { const s = stats[p.id] || {}; if ((s.declarationsWon || 0) > mostDecWon.val) mostDecWon = { pid: p.id, val: s.declarationsWon || 0 }; }
   out.push({ label: "Most Successful Declarations", value: named(mostDecWon.pid), detail: `${mostDecWon.val} won` });
 
-  // Most failed declarations (penalty taker)
   let mostFails = { pid: null, val: -1 };
-  for (const p of all) {
-    const s = stats[p.id] || {};
-    if ((s.declarationsFailed || 0) > mostFails.val) mostFails = { pid: p.id, val: s.declarationsFailed || 0 };
-  }
+  for (const p of all) { const s = stats[p.id] || {}; if ((s.declarationsFailed || 0) > mostFails.val) mostFails = { pid: p.id, val: s.declarationsFailed || 0 }; }
   out.push({ label: "Most Risky Declarer", value: named(mostFails.pid), detail: `${mostFails.val} failed declarations` });
 
-  // Best single hand (lowest)
   let bestHand = { pid: null, val: Infinity };
-  for (const p of all) {
-    const s = stats[p.id] || {};
-    if ((s.bestHandTotal ?? Infinity) < bestHand.val) bestHand = { pid: p.id, val: s.bestHandTotal };
-  }
+  for (const p of all) { const s = stats[p.id] || {}; if ((s.bestHandTotal ?? Infinity) < bestHand.val) bestHand = { pid: p.id, val: s.bestHandTotal }; }
   out.push({ label: "Lowest Hand Achieved", value: named(bestHand.pid), detail: bestHand.val !== Infinity ? `${bestHand.val} pts` : "" });
 
-  // Most sequences played
   let mostSeq = { pid: null, val: -1 };
-  for (const p of all) {
-    const s = stats[p.id] || {};
-    if ((s.sequencesPlayed || 0) > mostSeq.val) mostSeq = { pid: p.id, val: s.sequencesPlayed || 0 };
-  }
+  for (const p of all) { const s = stats[p.id] || {}; if ((s.sequencesPlayed || 0) > mostSeq.val) mostSeq = { pid: p.id, val: s.sequencesPlayed || 0 }; }
   out.push({ label: "Most Sequences", value: named(mostSeq.pid), detail: `${mostSeq.val} sequences` });
 
-  // Most quads played
   let mostQuads = { pid: null, val: -1 };
-  for (const p of all) {
-    const s = stats[p.id] || {};
-    if ((s.quadsPlayed || 0) > mostQuads.val) mostQuads = { pid: p.id, val: s.quadsPlayed || 0 };
-  }
+  for (const p of all) { const s = stats[p.id] || {}; if ((s.quadsPlayed || 0) > mostQuads.val) mostQuads = { pid: p.id, val: s.quadsPlayed || 0 }; }
   out.push({ label: "Most Four-of-a-Kinds", value: named(mostQuads.pid), detail: `${mostQuads.val} quads` });
 
-  // Most cards discarded
   let mostDisc = { pid: null, val: -1 };
-  for (const p of all) {
-    const s = stats[p.id] || {};
-    if ((s.cardsDiscarded || 0) > mostDisc.val) mostDisc = { pid: p.id, val: s.cardsDiscarded || 0 };
-  }
+  for (const p of all) { const s = stats[p.id] || {}; if ((s.cardsDiscarded || 0) > mostDisc.val) mostDisc = { pid: p.id, val: s.cardsDiscarded || 0 }; }
   out.push({ label: "Most Cards Discarded", value: named(mostDisc.pid), detail: `${mostDisc.val} cards` });
 
-  // Times had lowest hand
   let mostLow = { pid: null, val: -1 };
-  for (const p of all) {
-    const s = stats[p.id] || {};
-    if ((s.timesLowest || 0) > mostLow.val) mostLow = { pid: p.id, val: s.timesLowest || 0 };
-  }
+  for (const p of all) { const s = stats[p.id] || {}; if ((s.timesLowest || 0) > mostLow.val) mostLow = { pid: p.id, val: s.timesLowest || 0 }; }
   out.push({ label: "Most Often Lowest", value: named(mostLow.pid), detail: `${mostLow.val} rounds` });
 
   return out;
 }
 
-function renderChat() {
-  const card = el("div", "card-ui chat");
-  card.innerHTML = `<div class="section-title"><span>Chat</span></div>`;
+// =============== CHAT (modal) ===============
+
+function unreadCount() {
+  if (!state.room || !state.room.chat) return 0;
+  return Math.max(0, state.room.chat.length - state.lastSeenChatLen);
+}
+
+function openChat() {
+  state.modal = "chat";
+  state.lastSeenChatLen = (state.room && state.room.chat) ? state.room.chat.length : 0;
+  render();
+}
+
+function renderChatModalContent() {
+  const c = el("div", "");
+  c.innerHTML = `<h2>💬 Chat</h2>`;
   const list = el("div", "chat-list");
-  for (const m of state.room.chat || []) {
+  list.style.maxHeight = "55vh";
+  for (const m of (state.room && state.room.chat) || []) {
     const e = el("div", "");
     e.innerHTML = `<span class="from">${escapeHtml(m.from)}:</span> ${escapeHtml(m.text)}`;
     list.appendChild(e);
   }
-  card.appendChild(list);
+  c.appendChild(list);
   setTimeout(() => { list.scrollTop = list.scrollHeight; }, 0);
 
   const form = el("form", "chat-form");
-  form.innerHTML = `<input id="chat-input" placeholder="Say hi…" maxlength="200"/><button>Send</button>`;
+  form.style.marginTop = "12px";
+  form.innerHTML = `<input id="chat-input" placeholder="Type a message…" maxlength="200" autocomplete="off"/><button>Send</button>`;
   form.onsubmit = (e) => {
     e.preventDefault();
     const i = form.querySelector("#chat-input");
@@ -685,12 +715,14 @@ function renderChat() {
     if (!text) return;
     socket.emit("chat:send", { text });
     i.value = "";
+    state.lastSeenChatLen = (state.room.chat || []).length + 1;
   };
-  card.appendChild(form);
-  return card;
+  c.appendChild(form);
+  setTimeout(() => { const inp = form.querySelector("#chat-input"); if (inp) inp.focus(); }, 50);
+  return c;
 }
 
-// =============== MODALS ===============
+// =============== MODAL ===============
 
 function renderModal() {
   const wrap = el("div", "modal-bg");
@@ -699,9 +731,14 @@ function renderModal() {
   if (state.modal === "rules") modal.appendChild(renderRulesModalContent());
   else if (state.modal === "cardback") modal.appendChild(renderCardBackModalContent());
   else if (state.modal === "rules-settings") modal.appendChild(renderRulesSettingsModalContent());
+  else if (state.modal === "chat") modal.appendChild(renderChatModalContent());
   const closeRow = el("div", "close-row");
   const close = el("button", "ghost"); close.textContent = "Close";
-  close.onclick = () => { state.modal = null; render(); };
+  close.onclick = () => {
+    if (state.modal === "chat" && state.room && state.room.chat) state.lastSeenChatLen = state.room.chat.length;
+    state.modal = null;
+    render();
+  };
   closeRow.appendChild(close);
   modal.appendChild(closeRow);
   wrap.appendChild(modal);
@@ -725,11 +762,12 @@ function renderRulesModalContent() {
   c.appendChild(rulesExample("Pair (two same rank)", [{ rank: 7, suit: "S" }, { rank: 7, suit: "D" }]));
   c.appendChild(rulesExample("Four-of-a-kind", [{ rank: 9, suit: "S" }, { rank: 9, suit: "H" }, { rank: 9, suit: "D" }, { rank: 9, suit: "C" }]));
   c.appendChild(rulesExample("3-card sequence (consecutive)", [{ rank: 4, suit: "S" }, { rank: 5, suit: "H" }, { rank: 6, suit: "D" }]));
-  c.appendChild(rulesExample("5-card sequence (consecutive)", [{ rank: 7, suit: "S" }, { rank: 8, suit: "H" }, { rank: 9, suit: "D" }, { rank: 10, suit: "C" }, { rank: 11, suit: "S" }]));
+  c.appendChild(rulesExample("3-card sequence with Ace high (Q-K-A)", [{ rank: 12, suit: "S" }, { rank: 13, suit: "H" }, { rank: 1, suit: "D" }]));
+  c.appendChild(rulesExample("5-card sequence (10-J-Q-K-A also works)", [{ rank: 10, suit: "S" }, { rank: 11, suit: "H" }, { rank: 12, suit: "D" }, { rank: 13, suit: "C" }, { rank: 1, suit: "S" }]));
 
   const extra = el("div", "");
   extra.innerHTML = `
-    <p><small>Triplets and 4-card sequences are <b>off by default</b> but the host can enable them in settings.</small></p>
+    <p><small>Triplets and 4-card sequences are <b>off by default</b> but the host can enable them. Q-K-A and 10-J-Q-K-A are <b>always</b> valid. Wrap-around (K-A-2 etc.) is a host toggle.</small></p>
     <h2>Special pickup rule</h2>
     <p>If the previous player discarded a sequence, you may pick <b>any one card</b> from it (not just the top).</p>
     <h2>Declaration scoring</h2>
@@ -788,7 +826,6 @@ function renderRulesSettingsModalContent() {
     <p style="color:#cbd5e1">Tweak the rules to match your house style. ${isHost ? "" : "Only the host can change these."}</p>
   `;
 
-  // Numeric settings
   const numWrap = el("div", "");
   numWrap.innerHTML = `
     <div class="toggle-row">
@@ -811,9 +848,8 @@ function renderRulesSettingsModalContent() {
   c.appendChild(buildToggleRow("Allow triplets", "Three cards of same rank as a discard.", r.allowTriplets, "allowTriplets", isHost));
   c.appendChild(buildToggleRow("Allow 4-card sequences", "e.g. 4-5-6-7 in any suits.", r.allow4Seq, "allow4Seq", isHost));
   c.appendChild(buildToggleRow("Allow 6+ card sequences", "Long sequences: 6, 7, 8 cards…", r.allow6PlusSeq, "allow6PlusSeq", isHost));
-  c.appendChild(buildToggleRow("Allow wrap-around (Q-K-A)", "Sequences can wrap through the Ace as a high card.", r.allowWrapAround, "allowWrapAround", isHost));
+  c.appendChild(buildToggleRow("Allow wrap-around (K-A-2)", "Sequences can wrap from King through Ace to low cards.", r.allowWrapAround, "allowWrapAround", isHost));
 
-  // Spectator visibility
   c.appendChild(buildSettingToggleRow(
     "Spectators see all hands",
     "Eliminated players can see everyone's cards. Adds a fun couch-watching vibe.",
@@ -824,11 +860,12 @@ function renderRulesSettingsModalContent() {
 
   if (isHost) {
     const send = () => {
-      const rules = {
-        startingHandSize: Number(numWrap.querySelector("#hsize").value || 5),
-        declarationPenalty: Number(numWrap.querySelector("#dpen").value || 50),
-      };
-      socket.emit("room:settings", { rules });
+      socket.emit("room:settings", {
+        rules: {
+          startingHandSize: Number(numWrap.querySelector("#hsize").value || 5),
+          declarationPenalty: Number(numWrap.querySelector("#dpen").value || 50),
+        },
+      });
     };
     numWrap.querySelector("#hsize").onchange = send;
     numWrap.querySelector("#dpen").onchange = send;
@@ -838,35 +875,18 @@ function renderRulesSettingsModalContent() {
 
 function buildToggleRow(title, desc, value, key, isHost) {
   const row = el("div", "toggle-row");
-  row.innerHTML = `
-    <div>
-      <div><b>${escapeHtml(title)}</b></div>
-      <small>${escapeHtml(desc)}</small>
-    </div>
-  `;
+  row.innerHTML = `<div><div><b>${escapeHtml(title)}</b></div><small>${escapeHtml(desc)}</small></div>`;
   const tog = el("div", `toggle ${value ? "on" : ""} ${isHost ? "" : "disabled"}`);
-  if (isHost) {
-    tog.onclick = () => {
-      const next = !value;
-      socket.emit("room:settings", { rules: { [key]: next } });
-    };
-  }
+  if (isHost) tog.onclick = () => socket.emit("room:settings", { rules: { [key]: !value } });
   row.appendChild(tog);
   return row;
 }
 
 function buildSettingToggleRow(title, desc, value, key, isHost) {
   const row = el("div", "toggle-row");
-  row.innerHTML = `
-    <div>
-      <div><b>${escapeHtml(title)}</b></div>
-      <small>${escapeHtml(desc)}</small>
-    </div>
-  `;
+  row.innerHTML = `<div><div><b>${escapeHtml(title)}</b></div><small>${escapeHtml(desc)}</small></div>`;
   const tog = el("div", `toggle ${value ? "on" : ""} ${isHost ? "" : "disabled"}`);
-  if (isHost) {
-    tog.onclick = () => socket.emit("room:settings", { [key]: !value });
-  }
+  if (isHost) tog.onclick = () => socket.emit("room:settings", { [key]: !value });
   row.appendChild(tog);
   return row;
 }
