@@ -80,21 +80,29 @@ export function validateDiscard(cards, rules = DEFAULT_RULES) {
 
 function isSequential(ranks, allowWrap) {
   const sorted = ranks.slice().sort((a, b) => a - b);
+  // Standard ascending check (Ace as 1)
   let consecutive = true;
   for (let i = 1; i < sorted.length; i++) {
-    if (sorted[i] !== sorted[i - 1] + 1) {
-      consecutive = false;
-      break;
-    }
+    if (sorted[i] !== sorted[i - 1] + 1) { consecutive = false; break; }
   }
   if (consecutive) return true;
-  if (allowWrap) {
-    // try with Ace as 14 (Q-K-A or J-Q-K-A or K-A or 10-J-Q-K-A etc.)
-    if (sorted[0] === 1) {
-      const alt = sorted.slice(1).concat([14]).sort((a, b) => a - b);
+  // Ace HIGH — always allowed: Q-K-A, J-Q-K-A, 10-J-Q-K-A, etc.
+  if (sorted[0] === 1) {
+    const alt = sorted.slice(1).concat([14]).sort((a, b) => a - b);
+    let ok = true;
+    for (let i = 1; i < alt.length; i++)
+      if (alt[i] !== alt[i - 1] + 1) { ok = false; break; }
+    if (ok) return true;
+  }
+  // True wrap-around (K-A-2, Q-K-A-2, etc.) — host toggle
+  if (allowWrap && sorted.includes(1) && sorted.includes(13)) {
+    const set = new Set(sorted);
+    for (let start = 1; start <= 13; start++) {
       let ok = true;
-      for (let i = 1; i < alt.length; i++)
-        if (alt[i] !== alt[i - 1] + 1) { ok = false; break; }
+      for (let i = 0; i < sorted.length; i++) {
+        const want = ((start - 1 + i) % 13) + 1;
+        if (!set.has(want)) { ok = false; break; }
+      }
       if (ok) return true;
     }
   }
