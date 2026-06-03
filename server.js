@@ -35,9 +35,10 @@ const DEFAULT_SETTINGS = () => ({
 });
 
 function sanitizeGame(game, room, playerId) {
+  const inGame = playerId && game.playerIds.includes(playerId);
   const isEliminated = playerId && game.eliminated.includes(playerId);
-  const isSpectator = isEliminated || !playerId;
-  const yourHand = playerId ? game.hands[playerId] || [] : [];
+  const isSpectator = !inGame || isEliminated;
+  const yourHand = inGame && !isEliminated ? game.hands[playerId] || [] : [];
 
   let allHands = null;
   if (game.phase === "roundEnd" || game.phase === "gameEnd") {
@@ -169,11 +170,10 @@ io.on("connection", (socket) => {
       }
     }
 
-    if (room.started) return cb && cb({ ok: false, error: "Game already started" });
-
+    // Allow joining a started game as spectator
     const playerId = newPlayerId();
     room.players.push({ id: playerId, socketId: socket.id, name: (name || "Player").slice(0, 24),
-      connected: true, ready: false, cardBack: cardBack || "classic-blue", lastSeen: Date.now() });
+      connected: true, ready: !!(!room.started), cardBack: cardBack || "classic-blue", lastSeen: Date.now(), spectatorOnly: !!room.started });
     currentRoomCode = code;
     currentPlayerId = playerId;
     socket.join(code);
